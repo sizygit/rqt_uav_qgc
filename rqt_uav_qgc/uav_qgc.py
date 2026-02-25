@@ -1,11 +1,12 @@
 import os
+import re
 
 from ament_index_python.packages import get_package_share_directory
 
 from python_qt_binding import loadUi
 from python_qt_binding.QtCore import QTimer
 from python_qt_binding.QtWidgets import (
-    QLabel, QMessageBox, QProgressBar,
+    QLabel, QLineEdit, QMessageBox, QProgressBar,
     QPushButton, QWidget,
 )
 from rqt_gui_py.plugin import Plugin
@@ -34,32 +35,37 @@ class DroneCardManager:
     _GREEN  = 'color: #2ecc71;'
     _GREY   = 'color: #95a5a6;'
 
-    def __init__(self, card_widget: QWidget, parent_widget: QWidget, info_callback=None):
+    def __init__(self, card_widget: QWidget, parent_widget: QWidget, suffix: str = "", info_callback=None):
         """
         Parameters
         ----------
         card_widget   The droneCard QFrame as loaded from the .ui file.
         parent_widget The top-level QWidget (used for dialogs / QTimer parent).
-        info_callback Optional callable(str) to forward log messages (e.g. to InfoBrowser).
+        suffix        The name suffix for child widgets (e.g. "", "_2", "_3").
+        info_callback Optional callable(str) to forward log messages.
         """
         self._card          = card_widget
         self._parent        = parent_widget
+        self._suffix        = suffix
         self._info_callback = info_callback
 
         # ── Cache all child widget references via findChild ────────────── #
         def _w(cls, name):
-            wgt = card_widget.findChild(cls, name)
+            # When copying in Designer, children get the same suffix as the parent.
+            runtime_name = f"{name}{suffix}"
+            wgt = card_widget.findChild(cls, runtime_name)
             if wgt is None:
+                # Fallback: sometimes if the frame was copied, only the frame's name changed.
+                # But looking at User's .ui file, the children ARE renamed (e.g. droneIdLabel_2).
                 raise AttributeError(
-                    f"droneCard has no child widget '{name}' of type {cls.__name__}"
+                    f"droneCard{suffix} has no child widget '{runtime_name}' of type {cls.__name__}"
                 )
             return wgt
 
-        # self._statusDot     = _w(QLabel,       'statusDot')
-        self._droneIdLabel  = _w(QLabel,       'droneIdLabel')
-        self._ipLabel       = _w(QLabel,       'ipLabel')
-        self._userLabel     = _w(QLabel,       'userLabel')
-        self._passwordLabel = _w(QLabel,       'passwordLabel')
+        self._droneIdLineEdit  = _w(QLineEdit,    'droneIdLineEdit')
+        self._ipLineEdit       = _w(QLineEdit,    'ipLineEdit')
+        self._userLineEdit     = _w(QLineEdit,    'userLineEdit')
+        self._passwordLineEdit = _w(QLineEdit,    'passwordLineEdit')
         self._sshStatus     = _w(QLabel,       'sshStatus')
         self._agentStatus   = _w(QLabel,       'agentStatus')
         self._batteryBar    = _w(QProgressBar, 'batteryBar')
@@ -70,13 +76,21 @@ class DroneCardManager:
         self._shutdownBtn   = _w(QPushButton,  'shutdownBtn')
         self._statusTipLbl  = _w(QLabel,       'statusTip')
 
-        # ── Read static drone info from UI labels ──────────────────────── #
-        self._drone_id = self._droneIdLabel.text()   # e.g. "UAV1"
-        self._ip       = self._ipLabel.text()        # e.g. "10.42.0.1"
-        self._user     = self._userLabel.text()      # e.g. "luenberger"
-        self._password = self._passwordLabel.text()  # e.g. "111"
+        # ── Read static drone info ─────────────────────────────────────── #
+        full_text = self._droneIdLineEdit.text()        # e.g. "UAV1"
+        self._drone_id = full_text
+        
+        # Extract numeric ID (e.g., "UAV1" -> 1)
+        match = re.search(r'\d+', full_text)
+        self.numeric_id = int(match.group()) if match else 0
+        
+        self._ip       = self._ipLineEdit.text()        # e.g. "10.42.0.1"
+        self._user     = self._userLineEdit.text()      # e.g. "luenberger"
+        self._password = self._passwordLineEdit.text()  # e.g. "111"
 
         self._controller: sshDroneManager = None
+
+        self._pending_agent_start = False
 
         # ── QTimer: drain the output queue every 200 ms ────────────────── #
         self._poll_timer = QTimer(parent_widget)
@@ -93,10 +107,6 @@ class DroneCardManager:
         # ── Initial UI state ───────────────────────────────────────────── #
         self._apply_disconnected_state()
 
-    # ------------------------------------------------------------------ #
-    #  Button slots
-    # ------------------------------------------------------------------ #
-
     def _on_connect_toggled(self, checked: bool):
         if checked:
             self._do_connect()
@@ -104,7 +114,18 @@ class DroneCardManager:
             self._do_disconnect()
 
     def _do_connect(self):
-        """Create controller using credentials from UI labels, then SSH in background."""
+        """Create controller using credentials from UI line edits, then SSH."""
+        # Update credentials from UI before connecting
+        self._drone_id = self._droneIdLineEdit.text()
+        self._ip       = self._ipLineEdit.text()
+        self._user     = self._userLineEdit.text()
+        self._password = self._passwordLineEdit.text()
+
+        # Extract numeric ID for logic
+        import re
+        match = re.search(r'\d+', self._drone_id)
+        self.numeric_id = int(match.group()) if match else 0
+
         if self._controller is None:
             self._controller = sshDroneManager(
                 drone_id=self._drone_id,
@@ -176,8 +197,12 @@ class DroneCardManager:
 
             if msg == '__CONNECTED__':
                 self._apply_connected_state()
+                if self._pending_agent_start:
+                    self._on_start_agent()
+                    self._pending_agent_start = False
                 continue
             if msg == '__FAILED__':
+                self._pending_agent_start = False
                 self._connectBtn.blockSignals(True)
                 self._connectBtn.setChecked(False)
                 self._connectBtn.blockSignals(False)
@@ -233,6 +258,21 @@ class DroneCardManager:
         if self._controller:
             self._controller.cleanup()
 
+    def start_all_sequence(self):
+        """Helper for 'Start All' button: Connect if needed, then start agent."""
+        if self._controller and self._controller.is_connected:
+            if not self._controller.is_agent_running:
+                self._on_start_agent()
+        else:
+            self._pending_agent_start = True
+            # Explicitly trigger the toggle if not checked
+            if not self._connectBtn.isChecked():
+                self._connectBtn.setChecked(True)
+            else:
+                # If checked but not connected, ensure the worker is running
+                if not (self._controller and self._controller.is_connected):
+                    self._do_connect()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  RQT Plugin
@@ -287,17 +327,35 @@ class UavQgcPlugin(Plugin):
 
         # Connect signals
         # Assuming the UI has pushButton1 and pushButton2 based on ros2_rqt_plugin's UI
-        self._widget.pushButton1.clicked.connect(self.on_pushButton1_clicked)
         self._widget.pushButton2.clicked.connect(self.on_pushButton2_clicked)
+
+        # Connect Start All button using findChild to double check
+        btn_start_all = self._widget.findChild(QPushButton, 'stratAllBtn')
+        if btn_start_all:
+            btn_start_all.clicked.connect(self._on_start_all_clicked)
+            self._node.get_logger().info("Successfully bound stratAllBtn")
+        else:
+            self._node.get_logger().warning("Could not find stratAllBtn in UI!")
 
         # ── Drone card managers ───────────────────────────────────────────── #
         # One DroneCardManager per physical droneCard widget in the UI.
         self._drone_managers = []
-        self._drone_managers.append(
-            DroneCardManager(self._widget.droneCard, self._widget,
-                             info_callback=self._append_info)
-        )
-        # Add more managers here for additional drone cards as the UI grows.
+        
+        # We look only for droneCard (2 and 3 removed per user request).
+        configs = [
+            ("droneCard", ""),
+            ("droneCard_2", "_2"),
+            ("droneCard_3", "_3"),
+        ]
+
+        for card_name, suffix in configs:
+            card_w = getattr(self._widget, card_name, None)
+            if card_w:
+                mgr = DroneCardManager(
+                    card_w, self._widget, suffix=suffix, 
+                    info_callback=self._append_info
+                )
+                self._drone_managers.append(mgr)
 
     # ── Utility exposed to DroneCardManager ─────────────────────────────── #
 
@@ -306,15 +364,14 @@ class UavQgcPlugin(Plugin):
         self._info_edit.appendAnsi(msg)
         self._node.get_logger().info(msg)
 
-    # ── Original button handlers ─────────────────────────────────────────── #
+    def _on_start_all_clicked(self):
+        """Iterate through all drone managers and trigger connect/start agent."""
+        self._node.get_logger().info("Start All clicked")
+        print("Start All clicked") # In case of RQT console
+        for mgr in self._drone_managers:
+            mgr.start_all_sequence()
 
-    def on_pushButton1_clicked(self):
-        self._node.get_logger().info('Published to button1 topic!')
-        msg = Bool()
-        msg.data = True
-        self.button1_pub.publish(msg)
-        self.count_button_1 += 1
-        self._info_edit.appendAnsi(f'Button 1 was clicked {self.count_button_1}')
+    # ── Original button handlers ─────────────────────────────────────────── #
 
     def on_pushButton2_clicked(self):
         self._node.get_logger().info('Published to button2 topic!')
