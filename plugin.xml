@@ -1,0 +1,17 @@
+<library path="lib">
+  <class name="UavQgcPlugin" type="rqt_uav_qgc.uav_qgc.UavQgcPlugin" base_class_type="rqt_gui_py::Plugin">
+    <description>
+      A Python GUI plugin for UAV QGC.
+    </description>
+    <qtgui>
+      <group>
+        <label>UAV</label>
+        <icon type="theme">folder</icon>
+        <statustip>Plugins related to UAV.</statustip>
+      </group>
+      <label>UAV QGC Plugin</label>
+      <icon type="theme">media-playback-start</icon>
+      <statustip>A Python GUI plugin for UAV QGC.</statustip>
+    </qtgui>
+  </class>
+</library>
