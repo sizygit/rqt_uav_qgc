@@ -10,10 +10,11 @@ from python_qt_binding.QtWidgets import (
     QPushButton, QWidget,
 )
 from rqt_gui_py.plugin import Plugin
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 from .ansi_text_edit import AnsiTextEdit
 from .ssh_manager import sshDroneManager
+from .topic_monitor import TopicMonitor, resolve_msg_type
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -186,12 +187,15 @@ class DroneCardManager:
     # ------------------------------------------------------------------ #
 
     def _drain_queue(self):
-        if self._controller is None:
+        controller = self._controller
+        if controller is None:
             return
 
-        while not self._controller.output_queue.empty():
+        # Snapshot the queue to avoid race conditions or None errors during loop
+        q = controller.output_queue
+        while not q.empty():
             try:
-                msg = self._controller.output_queue.get_nowait()
+                msg = q.get_nowait()
             except Exception:
                 break
 
@@ -208,14 +212,14 @@ class DroneCardManager:
                 self._connectBtn.blockSignals(False)
                 self._controller = None   # allow retry with updated label values
                 self._apply_disconnected_state()
-                continue
+                return  # Exit immediately since controller is now None
 
-            # self._set_status_tip(msg)
             if self._info_callback:
                 self._info_callback(msg)
 
-        # Keep agent status label live.
-        self._set_agent_status(running=self._controller.is_agent_running)
+        # Keep agent status label live if still connected
+        if self._controller:
+            self._set_agent_status(running=self._controller.is_agent_running)
 
     def _apply_connected_state(self):
         # self._statusDot.setStyleSheet(self._GREEN + ' font-size: 16px;')
@@ -275,6 +279,118 @@ class DroneCardManager:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  TopicMonitorCardManager
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TopicMonitorCardManager:
+    """
+    Binds a single monitorFrame QFrame widget to a TopicMonitor instance.
+
+    Widget naming convention (same suffix pattern as DroneCardManager):
+      Frame       : monitorFrame{suffix}
+      Children    : startMonitorBtn{suffix}, topicNameEdit{suffix},
+                    monHzLabel{suffix},      monDataLabel{suffix}
+
+    Duplicate the frame in Qt Designer and give the copy the name
+    ``monitorFrame_2``; its children will automatically be found by suffix.
+    """
+
+    def __init__(self, frame_widget: QWidget, node, suffix: str = "", msg_type=String):
+        """
+        Parameters
+        ----------
+        frame_widget  The monitorFrame QFrame as loaded from the .ui file.
+        node          The rclpy Node used for creating subscriptions.
+        suffix        Widget-name suffix (e.g. "", "_2", "_3").
+        msg_type      ROS 2 message type to subscribe with (default: String).
+        """
+        self._frame    = frame_widget
+        self._node     = node
+        self._suffix   = suffix
+        self._msg_type = msg_type
+        self._monitor: TopicMonitor = None
+
+        def _w(cls, base_name):
+            name = f"{base_name}{suffix}"
+            wgt = frame_widget.findChild(cls, name)
+            if wgt is None:
+                raise AttributeError(
+                    f"monitorFrame{suffix} has no child '{name}' of type {cls.__name__}"
+                )
+            return wgt
+
+        self._startBtn    = _w(QPushButton, 'startMonitorBtn')
+        self._topicEdit   = _w(QLineEdit,   'topicNameEdit')
+        self._hzLabel     = _w(QLabel,      'monHzLabel')
+        self._dataLabel   = _w(QLabel,      'monDataLabel')
+
+        self._startBtn.setCheckable(True)
+        self._startBtn.toggled.connect(self._on_toggled)
+
+    # ------------------------------------------------------------------ #
+
+    def _on_toggled(self, checked: bool):
+        if checked:
+            topic_name = self._topicEdit.text().strip()
+            if not topic_name:
+                self._node.get_logger().error(
+                    f"[MonitorCard{self._suffix}] Topic name is empty!"
+                )
+                self._startBtn.blockSignals(True)
+                self._startBtn.setChecked(False)
+                self._startBtn.blockSignals(False)
+                return
+
+            # Auto-detect message type from live ROS 2 graph
+            msg_class, type_info = resolve_msg_type(self._node, topic_name)
+            if msg_class is None:
+                err = f"[MonitorCard{self._suffix}] {type_info}"
+                self._node.get_logger().error(err)
+                self._dataLabel.setText(type_info)
+                self._startBtn.blockSignals(True)
+                self._startBtn.setChecked(False)
+                self._startBtn.blockSignals(False)
+                return
+
+            self._node.get_logger().info(
+                f"[MonitorCard{self._suffix}] Detected type: {type_info}"
+            )
+            self._dataLabel.setText(f"Type: {type_info}  —  waiting for data...")
+
+            self._monitor = TopicMonitor(
+                self._node,
+                topic_name,
+                msg_class,
+                callback=self._on_msg,
+            )
+            self._node.get_logger().info(
+                f"[MonitorCard{self._suffix}] Monitoring '{topic_name}'"
+            )
+            self._startBtn.setText("Stop Monitor")
+        else:
+            if self._monitor:
+                self._monitor.stop()
+                self._monitor = None
+            self._startBtn.setText("ROS2 Monitor")
+            self._hzLabel.setText("0.0 Hz")
+            self._dataLabel.setText("Monitor stopped.")
+
+    def _on_msg(self, monitor: TopicMonitor):
+        """Called from the TopicMonitor subscription thread; updates UI labels."""
+        self._hzLabel.setText(f"{monitor.hz:.1f} Hz")
+        data_str = str(monitor.last_msg)
+        if len(data_str) > 200:
+            data_str = data_str[:200] + "..."
+        self._dataLabel.setText(data_str)
+
+    def cleanup(self):
+        """Stop any active subscription."""
+        if self._monitor:
+            self._monitor.stop()
+            self._monitor = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  RQT Plugin
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -326,8 +442,6 @@ class UavQgcPlugin(Plugin):
         self.count_button_2 = 0
 
         # Connect signals
-        # Assuming the UI has pushButton1 and pushButton2 based on ros2_rqt_plugin's UI
-        self._widget.pushButton2.clicked.connect(self.on_pushButton2_clicked)
 
         # Connect Start All button using findChild to double check
         btn_start_all = self._widget.findChild(QPushButton, 'stratAllBtn')
@@ -336,6 +450,31 @@ class UavQgcPlugin(Plugin):
             self._node.get_logger().info("Successfully bound stratAllBtn")
         else:
             self._node.get_logger().warning("Could not find stratAllBtn in UI!")
+
+        # ── Topic Monitor card managers ──────────────────────────────────── #
+        # One TopicMonitorCardManager per monitorFrame widget in the UI.
+        # Add more frames in Qt Designer (monitorFrame_2, monitorFrame_3 …)
+        # and they will be auto-discovered here.
+        self._monitor_managers = []
+        monitor_configs = [
+            ("monitorFrame",   ""),
+            ("monitorFrame_2", "_2"),
+            ("monitorFrame_3", "_3"),
+            ("monitorFrame_4", "_4"),
+        ]
+        for frame_name, suffix in monitor_configs:
+            frame_w = self._widget.findChild(QWidget, frame_name)
+            if frame_w:
+                try:
+                    mgr = TopicMonitorCardManager(
+                        frame_w, self._node, suffix=suffix
+                    )
+                    self._monitor_managers.append(mgr)
+                    self._node.get_logger().info(
+                        f"Bound TopicMonitorCardManager for '{frame_name}'"
+                    )
+                except AttributeError as exc:
+                    self._node.get_logger().warning(str(exc))
 
         # ── Drone card managers ───────────────────────────────────────────── #
         # One DroneCardManager per physical droneCard widget in the UI.
@@ -372,17 +511,10 @@ class UavQgcPlugin(Plugin):
             mgr.start_all_sequence()
 
     # ── Original button handlers ─────────────────────────────────────────── #
-
-    def on_pushButton2_clicked(self):
-        self._node.get_logger().info('Published to button2 topic!')
-        msg = Bool()
-        msg.data = True
-        self.button2_pub.publish(msg)
-        self.count_button_2 += 1
-        self._info_edit.appendAnsi(f'Button 2 was clicked {self.count_button_2}')
-
     def shutdown_plugin(self):
         for mgr in self._drone_managers:
+            mgr.cleanup()
+        for mgr in self._monitor_managers:
             mgr.cleanup()
 
     def save_settings(self, plugin_settings, instance_settings):
